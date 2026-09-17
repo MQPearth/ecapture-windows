@@ -23,6 +23,7 @@ CMD_CAT ?= cat
 CMD_MD5 ?= md5sum
 CMD_BPFTOOL ?= bpftool
 CMD_TAR ?= tar
+CMD_ZIP ?= zip
 CMD_RPM_SETUP_TREE ?= rpmdev-setuptree
 CMD_RPMBUILD ?= rpmbuild
 CMD_CHECKSUM ?= sha256sum
@@ -43,7 +44,8 @@ LIBPCAP_ARCH ?=
 GOARCH ?=
 DEBUG_PRINT ?=
 TARGET_ARCH = x86_64
-# Use clang as default compiler for both libpcap and cgo.
+# Use gcc as default compiler for both libpcap and cgo (Linux targets).
+# Windows cross-builds use MinGW gcc (see MINGW_CC above).
 CGO_ENABLED = 1
 TARGET_LIBPCAP = ./lib/libpcap.a
 TARGET_TAG ?= linux
@@ -135,6 +137,35 @@ ifdef CROSS_ARCH
 else
 	TARGET_ARCH = $(HOST_ARCH)
 endif
+
+#
+# Windows cross-compile (make windows). Reuses CROSS_ARCH when set (arm64|amd64);
+# otherwise defaults to HOST_ARCH (aarch64→arm64, x86_64→amd64).
+#
+ifdef CROSS_ARCH
+ ifeq ($(CROSS_ARCH),arm64)
+	WINDOWS_GOARCH = arm64
+	MINGW_TARGET = aarch64-w64-windows-gnu
+ else ifeq ($(CROSS_ARCH),amd64)
+	WINDOWS_GOARCH = amd64
+	MINGW_TARGET = x86_64-w64-windows-gnu
+ else
+	$(error unsupported CROSS_ARCH=$(CROSS_ARCH) for Windows; use arm64 or amd64)
+ endif
+else
+ ifeq ($(HOST_ARCH),aarch64)
+	WINDOWS_GOARCH = arm64
+	MINGW_TARGET = aarch64-w64-windows-gnu
+ else
+	WINDOWS_GOARCH = amd64
+	MINGW_TARGET = x86_64-w64-windows-gnu
+ endif
+endif
+
+# MinGW cross CC: uses x86_64-w64-mingw32-gcc for Windows amd64 builds.
+# ARM64 DLL builds are skipped (no inline hook needed — see schannel_hook.c:29).
+MINGW_CC = x86_64-w64-mingw32-gcc
+SCHANNEL_HOOK_SRC = contrib/schannel_hook/schannel_hook.c
 
 # Determine whether the command sudo exists
 # on docerk or the arm64 docker simulated by qemu, the sudo command does not exist

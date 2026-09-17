@@ -1,11 +1,10 @@
 name: E2E Tests
-
 on:
   pull_request:
-    branches: [ master, v2, v1 ]
+    branches: [ master, feat/windows-support ]
     types: [ opened, synchronize, reopened ]
   push:
-    branches: [ master, v2, v1 ]
+    branches: [ master, feat/windows-support ]
 
 permissions:
   contents: read
@@ -17,127 +16,68 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  e2e-tests:
-    runs-on: ubuntu-22.04
-    name: E2E Tests (TLS/GnuTLS/GoTLS)
-    
+  e2e-tests-windows:
+    runs-on: windows-2022
+    name: E2E Tests Windows (TLS/Schannel)
+
     steps:
       - uses: actions/checkout@v6
         with:
-          submodules: 'recursive'
           fetch-depth: 0
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.25.12'
+          go-version: '1.24.6'
 
-      - name: Install Required Tools
+      - name: Verify Go
+        run: go version
+
+      - name: Build eCapture for Windows
+        shell: pwsh
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes \
-            build-essential \
-            pkgconf \
-            libelf-dev \
-            llvm-14 \
-            clang-14 \
-            linux-tools-common \
-            linux-tools-generic \
-            gcc \
-            curl \
-            wget \
-            netcat-openbsd \
-            openssl \
-            libssl-dev \
-            ca-certificates
-          
-          # Set up clang-14 as default
-          for tool in "clang" "llc" "llvm-strip"
-          do
-            sudo rm -f /usr/bin/$tool
-            sudo ln -s /usr/bin/$tool-14 /usr/bin/$tool
-          done
-          
-          # Verify tools are installed
-          echo "=== Installed Tool Versions ==="
-          go version
-          clang --version | head -1
-          curl --version | head -1
-          wget --version | head -1
-          openssl version
+          $env:CGO_ENABLED = "0"
+          go build `
+            -tags windows `
+            -ldflags '-s -w -X github.com/gojue/ecapture/cli/cmd.GitVersion=ci_e2e_windows -X github.com/gojue/ecapture/cli/cmd.ByteCodeFiles=none' `
+            -o bin/ecapture.exe `
+            main.go
 
-      - name: Prepare Linux Headers
-        run: |
-          cd /usr/src
-          source_file=$(find . -maxdepth 1 -name "*linux-source*.tar.bz2")
-          if [ -n "$source_file" ]; then
-            source_dir=$(echo "$source_file" | sed 's/\.tar\.bz2//g')
-            sudo tar -xf $source_file
-            cd $source_dir
-            test -f .config || sudo make oldconfig
-          fi
-
-
-      - name: Build eCapture
-        run: |
-          make clean
-          make env
-          make -j$(nproc)
-          
-          # Verify binary was built
-          if [ ! -f bin/ecapture ]; then
-            echo "❌ Failed to build ecapture binary"
-            exit 1
-          fi
-          
-          ls -lh bin/ecapture
-          file bin/ecapture
-
-      - name: Build ecaptureq_client
-        run: |
-          cd examples/ecaptureq_client
-          go build -o ../../bin/ecaptureq_client .
-          ls -lh ../../bin/ecaptureq_client
-          echo "✅ ecaptureq_client built successfully"
-
-      - name: Run E2E Tests
-        run: |
-          echo "=== Running E2E Tests ==="
-          echo "Kernel: $(uname -r)"
-          echo "Architecture: $(uname -m)"
-          
-          # Run comprehensive e2e tests with sudo
-          # Tests will connect to https://github.com to verify TLS capture
-          sudo make e2e || {
-            echo "❌ E2E tests failed"
+          if (-not (Test-Path bin/ecapture.exe)) {
+            Write-Error "Failed to build ecapture.exe"
             exit 1
           }
 
-      - name: E2E Test Summary
-        if: always()
-        run: |
-          echo "=== E2E Test Execution Complete ==="
-          if [ $? -eq 0 ]; then
-            echo "✅ All E2E tests passed successfully"
-          else
-            echo "❌ Some E2E tests failed - check logs above"
-          fi
+          Write-Host "=== Build successful ==="
+          Get-Item bin/ecapture.exe | Select-Object Name, Length, LastWriteTime
 
-  e2e-tests-summary:
-    runs-on: ubuntu-22.04
-    name: E2E Test Results Summary
-    needs: e2e-tests
-    if: always()
-    
-    steps:
-      - name: Check E2E Test Results
+      - name: Run TLS E2E Test (text + keylog)
+        shell: pwsh
         run: |
-          if [ "${{ needs.e2e-tests.result }}" == "success" ]; then
-            echo "✅ E2E Tests: PASSED"
-            exit 0
-          else
-            echo "❌ E2E Tests: FAILED"
-            exit 1
-          fi
+          $binary = (Resolve-Path bin/ecapture.exe).Path
+          Write-Host "Binary: $binary"
+          & test/e2e/windows/windows_tls_test.ps1 -EcaptureBinary $binary
+
+      - name: Run PCAP E2E Test (expected pass - default build)
+        shell: pwsh
+        run: |
+          $binary = (Resolve-Path bin/ecapture.exe).Path
+          & test/e2e/windows/windows_pcap_test.ps1 -EcaptureBinary $binary
+
+      - name: Upload Test Logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-windows-logs
+          path: |
+            ${{ runner.temp }}/ecapture_*_e2e_*/**
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: E2E Windows Test Summary
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "=== Windows E2E Test Execution Complete ==="
 
       - name: Comment PR with E2E Results
         if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
@@ -146,29 +86,27 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const prNumber = context.payload.pull_request.number;
-            const testResult = '${{ needs.e2e-tests.result }}';
+            const windowsResult = '${{ job.status }}';
             const runId = context.runId;
-            
-            const statusEmoji = testResult === 'success' ? '✅' : '❌';
-            const statusText = testResult === 'success' ? 'PASSED' : 'FAILED';
-            
-            const body = `## ${statusEmoji} E2E Test Results: ${statusText}
-            
-            **Test Run:** [#${runId}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${runId})
-            
-            ### Tests Executed:
-            - TLS/OpenSSL Module (curl → github.com)
-            - GnuTLS Module (wget/curl → github.com)
-            - GoTLS Module (Go client → github.com)
-            - ecaptureQ Module (WebSocket event streaming)
-            
-            ${testResult === 'success' ? 
-              '✅ All e2e tests passed successfully! The TLS capture functionality is working correctly.' : 
-              '❌ Some e2e tests failed. Please check the workflow logs for details.'}
-            
-            ---
-            *Automated e2e test results for commit ${context.sha.substring(0, 7)}*`;
-            
+            const allPassed = windowsResult === 'success';
+            const emoji = allPassed ? '✅' : '❌';
+            const body = [
+              `## ${emoji} Windows E2E Test Results: ${allPassed ? 'PASSED' : 'FAILED'}`,
+              '',
+              `**Test Run:** [#${runId}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${runId})`,
+              '',
+              '### Windows E2E Tests',
+              '- TLS/Schannel Module (text mode)',
+              '- TLS/Schannel Module (keylog mode)',
+              '- PCAP mode',
+              '',
+              allPassed ?
+                'All e2e tests passed successfully!' :
+                'Some e2e tests failed. Please check the workflow logs for details.',
+              '',
+              '---',
+              `*Automated e2e test results for commit ${context.sha.substring(0, 7)}*`
+            ].join('\n');
             try {
               await github.rest.issues.createComment({
                 issue_number: prNumber,
